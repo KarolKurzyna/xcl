@@ -140,6 +140,17 @@ pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_w
     console_to_dxil_in(blob, stage, sampler_base, split_wave64, mem_windows())
 }
 
+/// Like `console_to_dxil_for`, disabling DXC's GVN pass for retrying driver-rejected shaders
+/// without overwriting the default `ShaderCache` / `translated` entries.
+pub fn console_to_dxil_without_gvn(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool) -> Result<Compiled, String> {
+    console_to_dxil_in_without_gvn(blob, stage, sampler_base, split_wave64, mem_windows())
+}
+
+/// Like `console_to_dxil_in`, disabling DXC's GVN pass and using a distinct DXIL disk-cache key.
+pub fn console_to_dxil_in_without_gvn(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
+    compile_console_shader_with_extra(blob, stage, sampler_base, windows, split_wave64, &["-opt-disable", "gvn"]).map(|(compiled, _)| compiled)
+}
+
 /// Global in-memory cache for translated shaders shared by `console_to_dxil_in` and `console_mesh`.
 fn shader_cache() -> &'static Mutex<ShaderCache> {
     static CACHE: OnceLock<Mutex<ShaderCache>> = OnceLock::new();
@@ -446,6 +457,10 @@ fn enormous(stage: Stage, hlsl_len: usize) -> bool {
 /// The program's DXIL, and whether it is an `enormous` one the direct translator made (its
 /// disk cache entry then follows that translator's version: `translated::cached`).
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(Compiled, bool), String> {
+    compile_console_shader_with_extra(blob, stage, sampler_base, windows, split_wave64, &[])
+}
+
+fn compile_console_shader_with_extra(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, extra: &[&str]) -> Result<(Compiled, bool), String> {
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
     if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
@@ -476,6 +491,9 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         }
     }
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
+    if !extra.is_empty() && extra.contains(&"-opt-disable") && t.hlsl.len() > 8 * 1024 * 1024 {
+        return Err("already compiled at -O0 without GVN".into());
+    }
     if enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
@@ -522,7 +540,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     }) {
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
-    let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
+    let dxil = dxc::compile_cached_with_extra(&t.hlsl, "main", profile, extra)?.0;
     Ok((Compiled { dxil, samplers: t.static_samplers }, false))
 }
 

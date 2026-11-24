@@ -4277,7 +4277,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 }
 
 unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
-    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
+    use crate::gpu::recomp::pso::{console_to_dxil_for, console_to_dxil_without_gvn, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return None;
     }
@@ -4297,7 +4297,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             return Some(Err(()));
         }
     };
-    let dxil = compiled.dxil;
+    let mut dxil = compiled.dxil;
     // a big program: the driver's compile takes it seconds to a minute (a retail game's 1 MB
     // ray-tracing resolve programs ~30 s each, ~600 of them): built in the background like one
     // whose DXIL is missing – the title's loading does not wait for it, its first bind does
@@ -4350,7 +4350,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         hr = retried;
         in_driver += took;
     }
-    let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
+    let mut reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
     if hr >= 0 && !reused {
         keep_compute_blob(key, *ppv, dxil.len());
         if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
@@ -4358,6 +4358,75 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         }
     } else if reused && from_disk {
         driver_cache::note(true, None);
+    }
+    if hr < 0 && !HEAP_WINDOW_OOM.with(|o| o.get()) {
+        let mut retry_reused = false;
+        let mut retry_in_driver = std::time::Duration::ZERO;
+        let mut retry_dxil = None;
+        let (retry_hr, retried) = retry_compute_pso_without_gvn(
+            hr,
+            &dxil,
+            || console_to_dxil_without_gvn(cs, Stage::Compute, 0, wave32_only(this)).map(|c| c.dxil),
+            |new_dxil| {
+                retry_dxil = Some(new_dxil.to_vec());
+                copy.CS = bytecode(new_dxil);
+                copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+                let retry_key = compute_blob_key(new_dxil, rs as usize, copy.Flags.0);
+                let mut retry_cached = compute_blob(retry_key);
+                let retry_disk = driver_cache::path(new_dxil, copy.Flags.0);
+                let retry_from_disk = retry_cached.is_none();
+                if retry_from_disk {
+                    retry_cached = retry_disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+                }
+                if let Some(b) = &retry_cached {
+                    copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+                }
+                let (mut retry_hr, mut took) = driver_compile_identified(
+                    "compute no-gvn",
+                    new_dxil.len(),
+                    gate_compute_driver_compile(retry_cached.is_some()),
+                    Some((record, retry_cached.is_some())),
+                    || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv),
+                );
+                if retry_hr < 0 && retry_cached.is_some() {
+                    forget_compute_blob(retry_key);
+                    if retry_from_disk {
+                        driver_cache::note(false, retry_disk.as_deref());
+                    }
+                    copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+                    let (uncached_hr, uncached_took) = driver_compile_identified(
+                        "compute no-gvn retry",
+                        new_dxil.len(),
+                        gate_compute_driver_compile(false),
+                        Some((record, false)),
+                        || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv),
+                    );
+                    retry_hr = uncached_hr;
+                    took += uncached_took;
+                }
+                let reused = retry_hr >= 0 && retry_cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
+                if retry_hr >= 0 && !reused {
+                    keep_compute_blob(retry_key, *ppv, new_dxil.len());
+                    if let (Some(p), Some(b)) = (retry_disk.as_deref(), compute_blob(retry_key)) {
+                        driver_cache::keep(p, &b, took);
+                    }
+                } else if reused && retry_from_disk {
+                    driver_cache::note(true, None);
+                }
+                retry_reused = reused;
+                retry_in_driver = took;
+                retry_hr
+            },
+        );
+        hr = retry_hr;
+        if let Some(retry_dxil) = retry_dxil {
+            dxil = retry_dxil;
+        }
+        if retried {
+            reused = retry_reused;
+            in_driver = retry_in_driver;
+            crate::xlog_info!("D3D12.X: compute PSO driver refusal succeeded after recompiling without DXC GVN");
+        }
     }
     if hr < 0 {
         // A huge program's verdict in the log itself: `note_translation_error` goes to the
@@ -4390,6 +4459,27 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         if reused { ", the driver's blob of an earlier build" } else { "" }
     );
     Some(Ok(hr))
+}
+
+/// Retry a driver-rejected compute PSO once using DXIL recompiled without DXC's GVN pass
+/// (avoiding handle phis that some drivers refuse with `E_OUTOFMEMORY`, #756).
+fn retry_compute_pso_without_gvn(
+    first_hr: HRESULT,
+    orig_dxil: &[u8],
+    recompile: impl FnOnce() -> Result<Vec<u8>, String>,
+    mut create: impl FnMut(&[u8]) -> HRESULT,
+) -> (HRESULT, bool) {
+    if first_hr >= 0 {
+        return (first_hr, false);
+    }
+    let Ok(retry_dxil) = recompile() else {
+        return (first_hr, false);
+    };
+    if retry_dxil == orig_dxil {
+        return (first_hr, false);
+    }
+    let hr2 = create(&retry_dxil);
+    (hr2, hr2 >= 0)
 }
 
 /// The blobs of `COMPUTE_BLOBS`, kept on disk between runs.
