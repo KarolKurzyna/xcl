@@ -150,7 +150,18 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
-    if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
+    let env_present = |name: &str| std::env::var_os(name).is_some();
+    let allow_negative = dxc::negative_cache_allowed_with(env_present);
+    if !cache_allowed(stage, env_present) {
+        if !allow_negative {
+            let ident = translated::identity();
+            if ident != 0 {
+                let fail_path = translated::fail_file(&dxc::cache_dir(), ident, blob, stage, sampler_base, windows, split_wave64);
+                if fail_path.is_file() {
+                    let _ = std::fs::remove_file(&fail_path);
+                }
+            }
+        }
         return compile_one().map(|(c, _)| c);
     }
     let key = ShaderKey {
@@ -163,8 +174,22 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     };
     // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
     // direct translator version, routing mode): never mixed with the HLSL path's entries
-    let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
+    let from_disk = || translated::cached_with_negative(&dxc::cache_dir(), allow_negative, blob, stage, sampler_base, windows, split_wave64, compile_one);
     cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
+}
+
+fn is_cacheable_translation_refusal(err: &str) -> bool {
+    if err == "DXIL not compiled yet"
+        || err.contains("dxcompiler.dll not found")
+        || err.contains("DXC: no compile threads")
+        || err.contains("DXC: the compile thread exited")
+    {
+        return false;
+    }
+    if err.starts_with("DXIL cache ") {
+        return err.contains("): dxc: ");
+    }
+    true
 }
 
 /// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run
@@ -180,6 +205,14 @@ mod translated {
     use std::sync::OnceLock;
 
     const MAGIC: &[u8; 8] = b"XCLTRAN2";
+    const FAIL_MAGIC: &[u8; 8] = b"XCLTRNF1";
+    const MAX_FAIL_REASON_BYTES: usize = 64 * 1024;
+
+    pub(super) enum FailLookup {
+        Hit(String),
+        Stale,
+        Miss,
+    }
 
     pub(super) fn identity_for(source: &str, toolchain: &str) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -239,7 +272,7 @@ mod translated {
 
     /// Translation semantics and the DXC DLLs, independent of link metadata and build profile.
     /// Zero means the disk cache is disabled.
-    fn identity() -> u64 {
+    pub(super) fn identity() -> u64 {
         static I: OnceLock<u64> = OnceLock::new();
         *I.get_or_init(|| {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
@@ -270,6 +303,25 @@ mod translated {
         })
     }
 
+    pub(super) fn capability_digest(ident: u64, stage: Stage, sampler_base: u32, windows: u32, split: bool) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let parts: [&[u8]; 6] = [
+            b"xcl-translated-fail-v1",
+            &ident.to_le_bytes(),
+            &[stage as u8],
+            &sampler_base.to_le_bytes(),
+            &windows.to_le_bytes(),
+            &[split as u8],
+        ];
+        for part in parts {
+            for &byte in part {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        h
+    }
+
     /// a second hash of the bytes, independent of `fnv64`'s
     fn hash2(b: &[u8]) -> u64 {
         b.iter().fold(0x9E37_79B9_7F4A_7C15u64, |h, &x| (h ^ x as u64).wrapping_mul(0xFF51_AFD7_ED55_8CCD).rotate_left(29))
@@ -280,6 +332,10 @@ mod translated {
             .join("v2")
             .join(format!("{ident:016x}"))
             .join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{}.bin", crate::gpu::shader::fnv64(blob), split as u8))
+    }
+
+    pub(super) fn fail_file(dir: &Path, ident: u64, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split: bool) -> PathBuf {
+        file(dir, ident, blob, stage, sampler_base, windows, split).with_extension("fail")
     }
 
     fn header(ident: u64, blob: &[u8]) -> Vec<u8> {
@@ -337,11 +393,75 @@ mod translated {
         }
     }
 
-    /// `cached_rerouted` for a translation that is never rerouted (the tests')
+    fn fail_header(ident: u64, cap_digest: u64, blob: &[u8]) -> Vec<u8> {
+        let mut h = FAIL_MAGIC.to_vec();
+        for v in [ident, cap_digest, blob.len() as u64, hash2(blob)] {
+            h.extend_from_slice(&v.to_le_bytes());
+        }
+        h
+    }
+
+    pub(super) fn load_fail_in(path: &Path, ident: u64, cap_digest: u64, blob: &[u8]) -> FailLookup {
+        let Ok(b) = std::fs::read(path) else {
+            return FailLookup::Miss;
+        };
+        let head = fail_header(ident, cap_digest, blob);
+        let Some(rest) = b.strip_prefix(head.as_slice()) else {
+            return FailLookup::Stale;
+        };
+        let Some((len_bytes, rest)) = rest.split_first_chunk::<4>() else {
+            return FailLookup::Stale;
+        };
+        let len = u32::from_le_bytes(*len_bytes) as usize;
+        if len > MAX_FAIL_REASON_BYTES || rest.len() != len {
+            return FailLookup::Stale;
+        }
+        match std::str::from_utf8(rest) {
+            Ok(reason) => FailLookup::Hit(reason.to_string()),
+            Err(_) => FailLookup::Stale,
+        }
+    }
+
+    pub(super) fn store_fail_in(path: &Path, ident: u64, cap_digest: u64, blob: &[u8], reason: &str) {
+        if reason.len() > MAX_FAIL_REASON_BYTES {
+            return;
+        }
+        let Some(dir) = path.parent() else { return };
+        let mut b = fail_header(ident, cap_digest, blob);
+        b.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+        b.extend_from_slice(reason.as_bytes());
+        let tmp = dir.join(format!("{}.{}.{:?}.tmp", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id(), std::thread::current().id()));
+        if path.is_file() {
+            let _ = std::fs::remove_file(path);
+        }
+        if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// `cached_rerouted` for a translation that is never rerouted (the tests').
     #[cfg(test)]
     pub(super) fn cached_in(
         dir: &Path,
         ident: u64,
+        blob: &[u8],
+        stage: Stage,
+        sampler_base: u32,
+        windows: u32,
+        split: bool,
+        translate: impl FnOnce() -> Result<Compiled, String>,
+    ) -> Result<Compiled, String> {
+        let cap_digest = capability_digest(ident, stage, sampler_base, windows, split);
+        cached_in_with_negative(dir, ident, cap_digest, true, blob, stage, sampler_base, windows, split, translate)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn cached_in_with_negative(
+        dir: &Path,
+        ident: u64,
+        cap_digest: u64,
+        allow_negative: bool,
         blob: &[u8],
         stage: Stage,
         sampler_base: u32,
@@ -357,12 +477,39 @@ mod translated {
             super::dxc::note_memory_hit();
             return Ok(c);
         }
-        let c = translate()?;
-        if !super::dxc::valid_dxil_container(&c.dxil) {
-            return Err("translated cache: translator returned an invalid DXIL container".into());
+        let fail_path = fail_file(dir, ident, blob, stage, sampler_base, windows, split);
+        if allow_negative {
+            match load_fail_in(&fail_path, ident, cap_digest, blob) {
+                FailLookup::Hit(reason) => {
+                    super::dxc::note_cached_failure(&reason);
+                    return Err(reason);
+                }
+                FailLookup::Stale => {
+                    let _ = std::fs::remove_file(&fail_path);
+                }
+                FailLookup::Miss => {}
+            }
+        } else if fail_path.is_file() {
+            let _ = std::fs::remove_file(&fail_path);
         }
-        store_in(&path, ident, blob, &c);
-        Ok(c)
+        match translate() {
+            Ok(c) => {
+                if !super::dxc::valid_dxil_container(&c.dxil) {
+                    return Err("translated cache: translator returned an invalid DXIL container".into());
+                }
+                store_in(&path, ident, blob, &c);
+                if fail_path.is_file() {
+                    let _ = std::fs::remove_file(&fail_path);
+                }
+                Ok(c)
+            }
+            Err(e) => {
+                if allow_negative && !super::dxc::has_missed() && super::is_cacheable_translation_refusal(&e) {
+                    store_fail_in(&fail_path, ident, cap_digest, blob, &e);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// `translate` through the disk (`identity()` zero: not used). An enormous compute program
@@ -378,6 +525,22 @@ mod translated {
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
         cached_rerouted(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, translate)
+    }
+
+    /// `translate` with capability-aware refusal markers and the direct-DXIL reroute identity.
+    pub(super) fn cached_with_negative(
+        dir: &Path,
+        allow_negative: bool,
+        blob: &[u8],
+        stage: Stage,
+        sampler_base: u32,
+        windows: u32,
+        split: bool,
+        translate: impl FnOnce() -> Result<(Compiled, bool), String>,
+    ) -> Result<Compiled, String> {
+        let ident = identity();
+        let direct = direct_output();
+        cached_rerouted_with_negative(dir, ident, direct, allow_negative, blob, stage, sampler_base, windows, split, translate)
     }
 
     /// What the direct translator's output depends on besides the HLSL path's identity: its
@@ -429,6 +592,63 @@ mod translated {
         let id = if direct { rerouted } else { ident };
         store_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob, &c);
         Ok(c)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cached_rerouted_with_negative(
+        dir: &Path,
+        ident: u64,
+        direct: u64,
+        allow_negative: bool,
+        blob: &[u8],
+        stage: Stage,
+        sampler_base: u32,
+        windows: u32,
+        split: bool,
+        translate: impl FnOnce() -> Result<(Compiled, bool), String>,
+    ) -> Result<Compiled, String> {
+        if ident == 0 {
+            return translate().map(|(c, _)| c);
+        }
+        let rerouted = rerouted_identity(ident, direct);
+        for id in [ident, rerouted] {
+            if let Some(c) = load_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob) {
+                super::dxc::note_memory_hit();
+                return Ok(c);
+            }
+        }
+        let cap_digest = capability_digest(ident, stage, sampler_base, windows, split);
+        let fail_path = fail_file(dir, ident, blob, stage, sampler_base, windows, split);
+        if allow_negative {
+            match load_fail_in(&fail_path, ident, cap_digest, blob) {
+                FailLookup::Hit(reason) => {
+                    super::dxc::note_cached_failure(&reason);
+                    return Err(reason);
+                }
+                FailLookup::Stale => {
+                    let _ = std::fs::remove_file(&fail_path);
+                }
+                FailLookup::Miss => {}
+            }
+        } else if fail_path.is_file() {
+            let _ = std::fs::remove_file(&fail_path);
+        }
+        match translate() {
+            Ok((c, is_direct)) => {
+                let id = if is_direct { rerouted } else { ident };
+                store_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob, &c);
+                if fail_path.is_file() {
+                    let _ = std::fs::remove_file(&fail_path);
+                }
+                Ok(c)
+            }
+            Err(e) => {
+                if allow_negative && !super::dxc::has_missed() && super::is_cacheable_translation_refusal(&e) {
+                    store_fail_in(&fail_path, ident, cap_digest, blob, &e);
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1797,6 +2017,128 @@ mod shader_cache_tests {
                 assert_eq!(thread.join().unwrap().unwrap().dxil[67], 1);
             }
         });
+    }
+
+    #[test]
+    fn translated_refusals_are_cached_and_invalidated_by_capability_digest() {
+        let dir = std::env::temp_dir().join(format!("xcl-pso-neg-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blob_refused = b"shader-unsupported-atomic";
+        let blob_other = b"shader-unrelated";
+        let ident = translated::identity_for("src-v1", "tc-1");
+        let cap_v1 = translated::capability_digest(ident, Stage::Compute, 0, 4, false);
+        let cap_v2 = translated::capability_digest(ident, Stage::Compute, 0, 4, true);
+        let cap_spec_changed = translated::capability_digest(translated::identity_for("src-v2", "tc-1"), Stage::Compute, 0, 4, false);
+        let cap_direct_v1 = translated::capability_digest(translated::identity_with("src-v1", "tc-1", translated::Backend::DirectCompute, 1), Stage::Compute, 0, 4, false);
+        let cap_direct_v2 = translated::capability_digest(translated::identity_with("src-v1", "tc-1", translated::Backend::DirectCompute, 2), Stage::Compute, 0, 4, false);
+        assert_ne!(cap_v1, cap_v2);
+        assert_ne!(cap_v1, cap_spec_changed);
+        assert_ne!(cap_v1, cap_direct_v1);
+        assert_ne!(cap_direct_v1, cap_direct_v2);
+
+        let err1 = translated::cached_in_with_negative(&dir, ident, cap_v1, true, blob_refused, Stage::Compute, 0, 4, false, || {
+            Err("incomplete translation, missing: [\"image_atomic_add\"]".into())
+        })
+        .err()
+        .unwrap();
+        assert_eq!(err1, "incomplete translation, missing: [\"image_atomic_add\"]");
+
+        // Second run with unchanged corpus & capabilities must not re-lower.
+        let err2 = translated::cached_in_with_negative(&dir, ident, cap_v1, true, blob_refused, Stage::Compute, 0, 4, false, || {
+            panic!("refusal marker must short-circuit before re-lowering")
+        })
+        .err()
+        .unwrap();
+        assert_eq!(err2, err1);
+
+        // Create a marker for an unrelated shader to confirm invalidating blob_refused leaves it alone.
+        let other_err = translated::cached_in_with_negative(&dir, ident, cap_v1, true, blob_other, Stage::Compute, 0, 4, false, || {
+            Err("incomplete translation, missing: [\"other_op\"]".into())
+        })
+        .err()
+        .unwrap();
+        assert_eq!(other_err, "incomplete translation, missing: [\"other_op\"]");
+
+        // Capability change invalidates only the affected marker while preserving unrelated ones.
+        let rebuilt = translated::cached_in_with_negative(&dir, ident, cap_v2, true, blob_refused, Stage::Compute, 0, 4, false, || {
+            Ok(compiled(77))
+        })
+        .unwrap();
+        assert_eq!(rebuilt.dxil[0], 77);
+        assert!(!translated::fail_file(&dir, ident, blob_refused, Stage::Compute, 0, 4, false).is_file());
+
+        let still_cached = translated::cached_in_with_negative(&dir, ident, cap_v1, true, blob_other, Stage::Compute, 0, 4, false, || {
+            panic!("unrelated negative marker must remain intact")
+        })
+        .err()
+        .unwrap();
+        assert_eq!(still_cached, other_err);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn translated_negative_markers_skip_and_delete_under_env_overrides() {
+        for name in [
+            "XCL_DEBUG_PS_SUB",
+            "XCL_SAFE_BARRIER",
+            "XCL_SPLIT_WAVE64",
+            "XCL_WAVE64_SPIN",
+            "XCL_NEGATIVE_CACHE",
+            "XCL_RECOMP_NO_STRUCTURED",
+        ] {
+            assert!(!dxc::negative_cache_allowed_with(|v| v == name), "{name} must disable negative markers");
+        }
+        assert!(dxc::negative_cache_allowed_with(|_| false));
+
+        let dir = std::env::temp_dir().join(format!("xcl-pso-neg-ovr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blob = b"shader-override-target";
+        let ident = translated::identity_for("src-v1", "tc-1");
+        let cap = translated::capability_digest(ident, Stage::Pixel, 0, 4, false);
+        let fail_path = translated::fail_file(&dir, ident, blob, Stage::Pixel, 0, 4, false);
+
+        assert!(translated::cached_in_with_negative(&dir, ident, cap, true, blob, Stage::Pixel, 0, 4, false, || {
+            Err("incomplete translation, missing: [\"op\"]".into())
+        })
+        .is_err());
+        assert!(fail_path.is_file());
+
+        // Under an env override (allow_negative = false), the marker is skipped, deleted, and not recreated.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        assert!(translated::cached_in_with_negative(&dir, ident, cap, false, blob, Stage::Pixel, 0, 4, false, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("override session refusal".into())
+        })
+        .is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!fail_path.is_file(), "override session must delete existing .fail marker and write none");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn translated_deferred_and_transient_errors_are_not_negative_cached() {
+        assert!(!is_cacheable_translation_refusal("DXIL not compiled yet"));
+        assert!(!is_cacheable_translation_refusal("DXIL cache x.dxil (cs_6_6, entry \"main\", 10 B HLSL): Compile: E_OUTOFMEMORY"));
+        assert!(!is_cacheable_translation_refusal("DXIL cache x.dxil (cs_6_6, entry \"main\", 10 B HLSL): dxccompiler: dxcompiler.dll not found"));
+        assert!(is_cacheable_translation_refusal("DXIL cache x.dxil (cs_6_6, entry \"main\", 10 B HLSL): dxc: error: invalid operand"));
+        assert!(is_cacheable_translation_refusal("incomplete translation, missing: [\"op\"]"));
+
+        let dir = std::env::temp_dir().join(format!("xcl-pso-neg-trans-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blob = b"shader-deferred";
+        let ident = translated::identity_for("src-v1", "tc-1");
+        let cap = translated::capability_digest(ident, Stage::Compute, 0, 4, false);
+        let fail_path = translated::fail_file(&dir, ident, blob, Stage::Compute, 0, 4, false);
+
+        let (r, missed) = dxc::cached_only(|| {
+            translated::cached_in_with_negative(&dir, ident, cap, true, blob, Stage::Compute, 0, 4, false, || {
+                dxc::compile_cached_in(&dir, "missing hlsl", "main", "cs_6_6")?;
+                Ok(compiled(1))
+            })
+        });
+        assert!(r.is_err() && missed);
+        assert!(!fail_path.is_file(), "cached_only deferral must not create a .fail marker");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

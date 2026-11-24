@@ -608,6 +608,8 @@ pub struct CacheStats {
     /// Compilation attempts, including failures.
     pub compilations: u64,
     pub compilation_failures: u64,
+    /// Deterministic failures satisfied from on-disk negative cache markers without compiling.
+    pub cached_failures: u64,
     /// First 20 distinct compiler errors.
     pub compilation_errors: Vec<String>,
 }
@@ -620,6 +622,7 @@ struct CacheCounters {
     deferred_misses: AtomicU64,
     compilations: AtomicU64,
     compilation_failures: AtomicU64,
+    cached_failures: AtomicU64,
     compilation_errors: Mutex<Vec<String>>,
 }
 
@@ -632,15 +635,28 @@ impl CacheCounters {
             deferred_misses: self.deferred_misses.load(Ordering::Relaxed),
             compilations: self.compilations.load(Ordering::Relaxed),
             compilation_failures: self.compilation_failures.load(Ordering::Relaxed),
+            cached_failures: self.cached_failures.load(Ordering::Relaxed),
             compilation_errors: self.compilation_errors.lock().unwrap().clone(),
+        }
+    }
+
+    fn record_error(&self, error: &str) {
+        let mut errors = self.compilation_errors.lock().unwrap();
+        if errors.len() < 20 && !errors.iter().any(|existing| existing == error) {
+            errors.push(error.to_string());
         }
     }
 
     fn failure(&self, error: String) -> String {
         self.compilation_failures.fetch_add(1, Ordering::Relaxed);
-        let mut errors = self.compilation_errors.lock().unwrap();
-        if errors.len() < 20 && !errors.contains(&error) {
-            errors.push(error.clone());
+        self.record_error(&error);
+        error
+    }
+
+    fn cached_failure(&self, error: String, record_error: bool) -> String {
+        self.cached_failures.fetch_add(1, Ordering::Relaxed);
+        if record_error {
+            self.record_error(&error);
         }
         error
     }
@@ -657,6 +673,10 @@ pub fn cache_stats() -> CacheStats {
 
 pub(super) fn note_memory_hit() {
     cache_counters().hits.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(super) fn note_cached_failure(reason: &str) {
+    cache_counters().cached_failure(reason.to_string(), reason.starts_with("DXIL cache "));
 }
 
 /// `compile` through a disk cache in `dir` (big translated programs take seconds in DXC;
@@ -793,6 +813,93 @@ where
     compile_cached_in_observed(dir, src, entry, profile, cache_counters(), compile_one)
 }
 
+const FAIL_MAGIC: &[u8; 8] = b"XCLFAIL1";
+const MAX_FAIL_REASON_BYTES: usize = 64 * 1024;
+
+pub(super) fn negative_cache_allowed_with(present: impl Fn(&str) -> bool) -> bool {
+    ![
+        "XCL_RECOMP_NO_STRUCTURED",
+        "XCL_RECOMP_WHY",
+        "XCL_X64_ALL_MASKS",
+        "XCL_WAVE64_SPIN",
+        "XCL_SAFE_BARRIER",
+        "XCL_SPLIT_WAVE64",
+        "XCL_DEBUG_MAGENTA",
+        "XCL_DEBUG_LOD0",
+        "XCL_DEBUG_PS_SUB",
+        "XCL_DEBUG_PS_EXPR",
+        "XCL_NEGATIVE_CACHE",
+    ]
+    .iter()
+    .any(|name| present(name))
+}
+
+fn is_deterministic_dxc_failure(raw_error: &str) -> bool {
+    raw_error.starts_with("dxc: ")
+}
+
+fn negative_capability_digest(source_id: &str, toolchain: &str, extra: &[&str]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for part in ["xcl-dxc-fail-v1", env!("CARGO_PKG_VERSION"), source_id, toolchain]
+        .into_iter()
+        .chain(extra.iter().copied())
+    {
+        for b in part.bytes().chain([0u8]) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}
+
+enum FailLookup {
+    Hit(String),
+    Stale,
+    Miss,
+}
+
+fn read_fail_marker(path: &Path, expected_digest: u64) -> FailLookup {
+    let Ok(bytes) = std::fs::read(path) else {
+        return FailLookup::Miss;
+    };
+    let Some(rest) = bytes.strip_prefix(FAIL_MAGIC) else {
+        return FailLookup::Stale;
+    };
+    let Some((digest_bytes, rest)) = rest.split_first_chunk::<8>() else {
+        return FailLookup::Stale;
+    };
+    let Some((len_bytes, rest)) = rest.split_first_chunk::<4>() else {
+        return FailLookup::Stale;
+    };
+    let digest = u64::from_le_bytes(*digest_bytes);
+    let len = u32::from_le_bytes(*len_bytes) as usize;
+    if digest != expected_digest || len > MAX_FAIL_REASON_BYTES || rest.len() != len {
+        return FailLookup::Stale;
+    }
+    match std::str::from_utf8(rest) {
+        Ok(reason) => FailLookup::Hit(reason.to_string()),
+        Err(_) => FailLookup::Stale,
+    }
+}
+
+fn write_fail_marker(dir: &Path, path: &Path, digest: u64, reason: &str) {
+    if reason.len() > MAX_FAIL_REASON_BYTES || std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let mut buf = Vec::with_capacity(FAIL_MAGIC.len() + 8 + 4 + reason.len());
+    buf.extend_from_slice(FAIL_MAGIC);
+    buf.extend_from_slice(&digest.to_le_bytes());
+    buf.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+    buf.extend_from_slice(reason.as_bytes());
+    let tmp = path.with_extension(format!("fail.tmp.{}.{:?}", std::process::id(), std::thread::current().id()));
+    if path.is_file() {
+        let _ = std::fs::remove_file(path);
+    }
+    if std::fs::write(&tmp, &buf).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 fn compile_cached_in_observed<F>(
     dir: &Path,
     src: &str,
@@ -804,12 +911,43 @@ fn compile_cached_in_observed<F>(
 where
     F: FnOnce() -> Result<Vec<u8>, String>,
 {
+    let cap_digest = negative_capability_digest(env!("XCL_TRANSLATOR_SOURCE_ID"), toolchain_identity(), &[]);
+    let allow_negative = negative_cache_allowed_with(|name| std::env::var_os(name).is_some());
+    compile_cached_in_observed_with_capability(dir, src, entry, profile, counters, cap_digest, allow_negative, compile_one)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_cached_in_observed_with_capability<F>(
+    dir: &Path,
+    src: &str,
+    entry: &str,
+    profile: &str,
+    counters: &CacheCounters,
+    cap_digest: u64,
+    allow_negative: bool,
+    compile_one: F,
+) -> Result<(Vec<u8>, bool), String>
+where
+    F: FnOnce() -> Result<Vec<u8>, String>,
+{
     let key = cache_key(src, entry, profile);
     let dir = normalized_cache_dir(dir);
     let file = dir.join(format!("{key:016x}.dxil"));
+    let fail_file = dir.join(format!("{key:016x}.fail"));
     if let Some(b) = cached_file(&file) {
         counters.hits.fetch_add(1, Ordering::Relaxed);
         return Ok((b, true));
+    }
+    if allow_negative {
+        match read_fail_marker(&fail_file, cap_digest) {
+            FailLookup::Hit(reason) => return Err(counters.cached_failure(reason, true)),
+            FailLookup::Stale => {
+                let _ = std::fs::remove_file(&fail_file);
+            }
+            FailLookup::Miss => {}
+        }
+    } else if fail_file.is_file() {
+        let _ = std::fs::remove_file(&fail_file);
     }
     // before the locks: a cached-only attempt (non-blocking pipeline creation) must not wait
     // for a worker compiling the same shader
@@ -827,13 +965,22 @@ where
         counters.coalesced_hits.fetch_add(1, Ordering::Relaxed);
         return Ok((b, true));
     }
+    if allow_negative {
+        match read_fail_marker(&fail_file, cap_digest) {
+            FailLookup::Hit(reason) => return Err(counters.cached_failure(reason, true)),
+            FailLookup::Stale => {
+                let _ = std::fs::remove_file(&fail_file);
+            }
+            FailLookup::Miss => {}
+        }
+    }
     // A corrupt target must be removed before the atomic rename on Windows;
     // rename does not replace an existing file there.
     if file.is_file() {
         let _ = std::fs::remove_file(&file);
     }
     counters.compilations.fetch_add(1, Ordering::Relaxed);
-    let b = {
+    let compiled = {
         let _active = Compiling::start();
         compile_one()
     }
@@ -845,12 +992,26 @@ where
         }
     })
     .map_err(|e| {
-        counters.failure(format!(
+        let deterministic = is_deterministic_dxc_failure(&e);
+        let formatted = counters.failure(format!(
             "DXIL cache {} ({profile}, entry {entry:?}, {} B HLSL): {e}",
             file.display(),
             src.len()
-        ))
-    })?;
+        ));
+        (formatted, deterministic)
+    });
+    let b = match compiled {
+        Ok(b) => b,
+        Err((formatted, deterministic)) => {
+            if allow_negative && deterministic {
+                write_fail_marker(&dir, &fail_file, cap_digest, &formatted);
+            }
+            return Err(formatted);
+        }
+    };
+    if fail_file.is_file() {
+        let _ = std::fs::remove_file(&fail_file);
+    }
     if std::fs::create_dir_all(&dir).is_ok() {
         // write to a temporary name first: another thread / process may be reading
         let tmp = file.with_extension(format!("tmp{}", std::process::id()));
@@ -915,6 +1076,11 @@ pub fn defer() -> bool {
 /// Inside `cached_only`.
 pub fn in_cached_only() -> bool {
     CACHED_ONLY.with(|c| c.get())
+}
+
+/// Did the current `cached_only` scope observe any deferred miss?
+pub(super) fn has_missed() -> bool {
+    MISSED.with(|m| m.get())
 }
 
 pub fn compile_cached(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
@@ -1268,5 +1434,107 @@ mod cache_tests {
             release_tx.send(()).unwrap();
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
+    }
+
+    #[test]
+    fn dxc_deterministic_failures_are_cached_and_replayed() {
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-neg-hit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = "broken hlsl shader";
+        let cap = negative_capability_digest("rev-1", "tc-1", &[]);
+        let counters1 = CacheCounters::default();
+        let err1 = compile_cached_in_observed_with_capability(&dir, src, "main", "cs_6_6", &counters1, cap, true, || {
+            Err("dxc: error: undeclared identifier".into())
+        })
+        .unwrap_err();
+        assert_eq!(counters1.snapshot().compilations, 1);
+        assert_eq!(counters1.snapshot().compilation_failures, 1);
+        assert_eq!(counters1.snapshot().cached_failures, 0);
+
+        let counters2 = CacheCounters::default();
+        let err2 = compile_cached_in_observed_with_capability(&dir, src, "main", "cs_6_6", &counters2, cap, true, || {
+            panic!("cached failure marker must avoid DXC re-invocation")
+        })
+        .unwrap_err();
+        assert_eq!(err2, err1);
+        let stats2 = counters2.snapshot();
+        assert_eq!((stats2.compilations, stats2.compilation_failures, stats2.cached_failures), (0, 0, 1));
+        assert_eq!(stats2.compilation_errors, vec![err1.clone()]);
+
+        let (probe, missed) = cached_only(|| {
+            compile_cached_in_observed_with_capability(&dir, src, "main", "cs_6_6", &counters2, cap, true, || {
+                panic!("cached_only must hit negative marker without deferring")
+            })
+        });
+        assert_eq!(probe.unwrap_err(), err1);
+        assert!(!missed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dxc_negative_marker_invalidates_on_capability_change_and_env_override() {
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-neg-inv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = "fixable shader";
+        let key = cache_key(src, "main", "cs_6_6");
+        let fail_path = dir.join(format!("{key:016x}.fail"));
+        let cap_old = negative_capability_digest("rev-1", "tc-1", &[]);
+        let cap_new = negative_capability_digest("rev-2", "tc-1", &[]);
+        let cap_other = negative_capability_digest("rev-1", "tc-1", &["-opt-disable", "gvn"]);
+        assert_ne!(cap_old, cap_new);
+        assert_ne!(cap_old, cap_other);
+
+        let c1 = CacheCounters::default();
+        assert!(compile_cached_in_observed_with_capability(&dir, src, "main", "cs_6_6", &c1, cap_old, true, || {
+            Err("dxc: unsupported opcode".into())
+        })
+        .is_err());
+        assert!(fail_path.is_file());
+
+        // Debugging / capability override skips AND deletes existing marker and never writes a new one.
+        let c_ovr = CacheCounters::default();
+        assert!(compile_cached_in_observed_with_capability(&dir, src, "main", "cs_6_6", &c_ovr, cap_old, false, || {
+            Err("dxc: debug session refusal".into())
+        })
+        .is_err());
+        assert!(!fail_path.is_file(), "override session must delete stale marker and write none");
+        assert_eq!(c_ovr.snapshot().compilations, 1);
+
+        // Recreate marker under cap_old, then drift capability digest to cap_new -> invalidates & succeeds.
+        assert!(compile_cached_in_observed_with_capability(&dir, src, "main", "cs_6_6", &CacheCounters::default(), cap_old, true, || {
+            Err("dxc: still failing under rev-1".into())
+        })
+        .is_err());
+        assert!(fail_path.is_file());
+        let c2 = CacheCounters::default();
+        let (dxil, hit) = compile_cached_in_observed_with_capability(&dir, src, "main", "cs_6_6", &c2, cap_new, true, || {
+            Ok(synthetic_dxil(42))
+        })
+        .unwrap();
+        assert!(!hit && dxil == synthetic_dxil(42));
+        assert!(!fail_path.is_file(), "successful rebuild under new capability must remove old .fail marker");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dxc_transient_failures_are_not_negative_cached() {
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-neg-trans-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cap = negative_capability_digest("rev-1", "tc-1", &[]);
+        for (i, msg) in [
+            "Compile: E_OUTOFMEMORY",
+            "DXC: no compile threads",
+            "dxcompiler.dll not found",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let src = format!("transient {i}");
+            let counters = CacheCounters::default();
+            assert!(compile_cached_in_observed_with_capability(&dir, &src, "main", "cs_6_6", &counters, cap, true, || Err(msg.into())).is_err());
+            let fail_path = dir.join(format!("{:016x}.fail", cache_key(&src, "main", "cs_6_6")));
+            assert!(!fail_path.is_file(), "transient error {msg:?} must not leave a .fail marker");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
