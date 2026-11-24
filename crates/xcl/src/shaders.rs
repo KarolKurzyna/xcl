@@ -1229,25 +1229,31 @@ impl Pipelines {
         let _ = self.make_with_cache_path_result(c, path_override);
     }
 
-    fn make_with_cache_path_and_retry(&self, name: &str, c: &recomp::pso::Compiled, retry_without_gvn: impl FnOnce() -> Option<recomp::pso::Compiled>) {
-        if self.make_with_cache_path_result(c, None) != Some(false) {
-            return;
-        }
+    fn make_with_cache_path_and_retry(&self, name: &str, c: &recomp::pso::Compiled, retry_without_gvn: impl FnOnce() -> Option<recomp::pso::WithoutGvn>) {
+        let Some(Err(first_error)) = self.make_with_cache_path_result(c, None) else { return };
         let Some(nogvn) = retry_without_gvn() else { return };
-        if nogvn.dxil == c.dxil {
+        if nogvn.compiled.dxil == c.dxil {
             return;
         }
+        let reason = crate::hle::d3d12x::real::first_error_line(&first_error).unwrap_or(&first_error).to_string();
         // Count the retry as the pipeline's final result, not as an extra refused pipeline.
         self.refused.fetch_sub(1, Ordering::Relaxed);
-        let retried = self.make_with_cache_path_result(&nogvn, None);
-        if retried.is_none() {
-            self.refused.fetch_add(1, Ordering::Relaxed);
-        } else if retried == Some(true) {
-            eprintln!("  {name}: driver refused compute pipeline; built without GVN ({} B DXIL)", nogvn.dxil.len());
+        let retried = self.make_with_cache_path_result(&nogvn.compiled, None);
+        match retried {
+            None => {
+                self.refused.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(Ok(())) => eprintln!(
+                "  {name}: driver refused compute pipeline ({reason}); built without GVN (dxil cache {:016x} -> {:016x}, {} B DXIL)",
+                nogvn.rejected_key,
+                nogvn.retry_key,
+                nogvn.compiled.dxil.len()
+            ),
+            Some(Err(_)) => {}
         }
     }
 
-    fn make_with_cache_path_result(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) -> Option<bool> {
+    fn make_with_cache_path_result(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) -> Option<Result<(), String>> {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
         let rs = {
@@ -1332,7 +1338,7 @@ impl Pipelines {
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-        let ok = r.is_ok();
+        let error = r.as_ref().err().map(ToString::to_string);
         let done = match r {
             Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
             Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
@@ -1340,7 +1346,7 @@ impl Pipelines {
         if done % 25 == 0 {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
         }
-        Some(ok)
+        Some(error.map_or(Ok(()), Err))
     }
 }
 

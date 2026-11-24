@@ -593,6 +593,10 @@ fn cache_key_for_toolchain_extra(src: &str, entry: &str, profile: &str, toolchai
     h
 }
 
+pub(super) fn cache_key_with_extra(src: &str, entry: &str, profile: &str, extra: &[&str]) -> u64 {
+    cache_key_for_toolchain_extra(src, entry, profile, toolchain_identity(), extra)
+}
+
 #[cfg(test)]
 fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
     cache_key_for_toolchain(src, entry, profile, toolchain_identity())
@@ -838,7 +842,7 @@ fn compile_cached_in_observed_with_extra<F>(
 where
     F: FnOnce() -> Result<Vec<u8>, String>,
 {
-    let key = cache_key_for_toolchain_extra(src, entry, profile, toolchain_identity(), extra);
+    let key = cache_key_with_extra(src, entry, profile, extra);
     let dir = normalized_cache_dir(dir);
     let file = dir.join(format!("{key:016x}.dxil"));
     if let Some(b) = cached_file(&file) {

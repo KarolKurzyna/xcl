@@ -555,6 +555,11 @@ pub fn init() -> Result<String, String> {
     }
 }
 
+thread_local! {
+    /// First line of the latest error-severity D3D12 debug layer message on this thread.
+    static LAST_D3D12_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 /// A debug layer message: errors and warnings into the log – the first 8 of each message id
 /// (3 000 in all). One cap for all of them (200) was used up in seconds by two per-frame state
 /// errors of a retail game, long before the message that came with its device removal.
@@ -563,6 +568,12 @@ unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, sever
     static PER_ID: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
     if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
         return;
+    }
+    if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && !text.is_null() {
+        let msg = String::from_utf8_lossy(text.as_bytes());
+        if let Some(line) = first_error_line(&msg) {
+            LAST_D3D12_ERROR.with(|e| *e.borrow_mut() = Some(line.to_string()));
+        }
     }
     {
         let mut g = PER_ID.lock().unwrap();
@@ -4326,6 +4337,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     // in the background, a few at a time and within the commit headroom the program asks for
     let record = crate::gpu::shader::fnv64(cs);
+    LAST_D3D12_ERROR.with(|e| *e.borrow_mut() = None);
     let (mut hr, mut in_driver) = driver_compile_identified(
         "compute",
         dxil.len(),
@@ -4359,15 +4371,28 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     } else if reused && from_disk {
         driver_cache::note(true, None);
     }
+    let mut retried_no_gvn: Option<(u64, u64, String)> = None;
+    let mut failure_note: Option<String> = None;
     if hr < 0 && !HEAP_WINDOW_OOM.with(|o| o.get()) {
+        let first_hr = hr;
+        let first_msg = LAST_D3D12_ERROR.with(|e| e.borrow_mut().take());
+        let first_reason = format_driver_rejection(first_hr, first_msg.as_deref());
         let mut retry_reused = false;
         let mut retry_in_driver = std::time::Duration::ZERO;
         let mut retry_dxil = None;
+        let mut retry_keys = None;
+        let mut retry_attempted = false;
         let (retry_hr, retried) = retry_compute_pso_without_gvn(
-            hr,
+            first_hr,
             &dxil,
-            || console_to_dxil_without_gvn(cs, Stage::Compute, 0, wave32_only(this)).map(|c| c.dxil),
+            || {
+                let without = console_to_dxil_without_gvn(cs, Stage::Compute, 0, wave32_only(this))?;
+                retry_keys = Some((without.rejected_key, without.retry_key));
+                Ok(without.compiled.dxil)
+            },
             |new_dxil| {
+                LAST_D3D12_ERROR.with(|e| *e.borrow_mut() = None);
+                retry_attempted = true;
                 retry_dxil = Some(new_dxil.to_vec());
                 copy.CS = bytecode(new_dxil);
                 copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
@@ -4425,7 +4450,19 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         if retried {
             reused = retry_reused;
             in_driver = retry_in_driver;
-            crate::xlog_info!("D3D12.X: compute PSO driver refusal succeeded after recompiling without DXC GVN");
+            retried_no_gvn = retry_keys.map(|(g, ng)| (g, ng, first_reason.clone()));
+        } else {
+            failure_note = Some(if retry_attempted {
+                let retry_msg = LAST_D3D12_ERROR.with(|e| e.borrow_mut().take());
+                let retry_reason = format_driver_rejection(hr, retry_msg.as_deref());
+                if let Some((g, ng)) = retry_keys {
+                    format!("{first_reason}; retry without GVN {g:016x} -> {ng:016x} refused: {retry_reason}")
+                } else {
+                    retry_reason
+                }
+            } else {
+                first_reason
+            });
         }
     }
     if hr < 0 {
@@ -4443,7 +4480,10 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
                 in_driver.as_millis()
             );
         }
-        note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
+        note_translation_error(format!(
+            "the driver rejected the compute PSO with the translated CS ({})",
+            failure_note.unwrap_or_else(|| format!("{hr:#x}"))
+        ));
         return Some(Err(()));
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
@@ -4452,13 +4492,29 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
+    let retry_note = retried_no_gvn
+        .map(|(g, ng, reason)| format!(", retried without GVN (dxil cache {g:016x} -> {ng:016x}; driver refused: {reason})"))
+        .unwrap_or_default();
     crate::xlog_info!(
-        "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
+        "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{}{})",
         dxil.len(),
         in_driver.as_millis(),
-        if reused { ", the driver's blob of an earlier build" } else { "" }
+        if reused { ", the driver's blob of an earlier build" } else { "" },
+        retry_note
     );
     Some(Ok(hr))
+}
+
+pub(crate) fn first_error_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|l| !l.is_empty())
+}
+
+fn format_driver_rejection(hr: HRESULT, retained_message: Option<&str>) -> String {
+    if let Some(line) = retained_message.and_then(first_error_line) {
+        return format!("{hr:#x}: {line}");
+    }
+    let msg = windows::core::Error::from_hresult(windows::core::HRESULT(hr)).to_string();
+    first_error_line(&msg).map(str::to_string).unwrap_or_else(|| format!("{hr:#x}"))
 }
 
 /// Retry a driver-rejected compute PSO once using DXIL recompiled without DXC's GVN pass
