@@ -1097,15 +1097,17 @@ mod cache_tests {
     #[test]
     fn dxil_cache_with_extra_flags_round_trip() {
         if location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
             return;
         }
         let dir = std::env::temp_dir().join(format!("xcl-dxil-extra-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let src = "RWByteAddressBuffer b : register(u0); [numthreads(1, 1, 1)] void main() { b.Store(0, 1u); }";
+        let src = "RWByteAddressBuffer o : register(u0);\n[numthreads(64, 1, 1)] void main(uint3 t : SV_DispatchThreadID) {\n    uint a = o.Load(t.x * 4);\n    uint b = (a & 1) ? o.Load(t.x * 4 + 256) : o.Load(t.x * 4 + 256) + 1;\n    o.Store(t.x * 4, b);\n}";
         let (default_dxil, hit0) = compile_cached_in(&dir, src, "main", "cs_6_6").unwrap();
         let (nogvn_dxil, hit1) = compile_cached_in_with_extra(&dir, src, "main", "cs_6_6", &["-opt-disable", "gvn"]).unwrap();
         assert!(!hit0 && !hit1);
         assert!(valid_dxil_container(&default_dxil) && valid_dxil_container(&nogvn_dxil));
+        assert_ne!(default_dxil, nogvn_dxil, "-opt-disable gvn must change the compiled DXIL");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "extra-flag build must use a distinct cache entry");
         let (cached_nogvn, hit2) = compile_cached_in_with_extra(&dir, src, "main", "cs_6_6", &["-opt-disable", "gvn"]).unwrap();
         assert!(hit2 && cached_nogvn == nogvn_dxil);

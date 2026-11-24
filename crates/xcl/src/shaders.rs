@@ -1220,17 +1220,16 @@ impl Pipelines {
         }
     }
 
-    /// The compute pipeline of `c` (made and released).
-    fn make(&self, c: &recomp::pso::Compiled) {
-        self.make_with_cache_path(c, None);
-    }
-
+    #[cfg(test)]
     fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
         let _ = self.make_with_cache_path_result(c, path_override);
     }
 
     fn make_with_cache_path_and_retry(&self, name: &str, c: &recomp::pso::Compiled, retry_without_gvn: impl FnOnce() -> Option<recomp::pso::WithoutGvn>) {
-        let Some(Err(first_error)) = self.make_with_cache_path_result(c, None) else { return };
+        let Some((Err(first_error), first_elapsed)) = self.make_with_cache_path_result(c, None) else { return };
+        if first_elapsed > crate::hle::d3d12x::real::NO_GVN_RETRY_MAX_REFUSAL {
+            return;
+        }
         let Some(nogvn) = retry_without_gvn() else { return };
         if nogvn.compiled.dxil == c.dxil {
             return;
@@ -1243,17 +1242,17 @@ impl Pipelines {
             None => {
                 self.refused.fetch_add(1, Ordering::Relaxed);
             }
-            Some(Ok(())) => eprintln!(
+            Some((Ok(()), _)) => eprintln!(
                 "  {name}: driver refused compute pipeline ({reason}); built without GVN (dxil cache {:016x} -> {:016x}, {} B DXIL)",
                 nogvn.rejected_key,
                 nogvn.retry_key,
                 nogvn.compiled.dxil.len()
             ),
-            Some(Err(_)) => {}
+            Some((Err(_), _)) => {}
         }
     }
 
-    fn make_with_cache_path_result(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) -> Option<Result<(), String>> {
+    fn make_with_cache_path_result(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) -> Option<(Result<(), String>, std::time::Duration)> {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
         let rs = {
@@ -1318,12 +1317,14 @@ impl Pipelines {
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return None;
         }
-        let r = if let Some(pso) = from_cache {
+        let (r, elapsed) = if let Some(pso) = from_cache {
             self.reused.fetch_add(1, Ordering::Relaxed);
-            Ok(pso)
+            (Ok(pso), std::time::Duration::ZERO)
         } else {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            let t0 = std::time::Instant::now();
             let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+            let elapsed = t0.elapsed();
             if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
                 if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
                     let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
@@ -1333,7 +1334,7 @@ impl Pipelines {
                     }
                 }
             }
-            pso
+            (pso, elapsed)
         };
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
@@ -1346,7 +1347,7 @@ impl Pipelines {
         if done % 25 == 0 {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
         }
-        Some(error.map_or(Ok(()), Err))
+        Some((error.map_or(Ok(()), Err), elapsed))
     }
 }
 

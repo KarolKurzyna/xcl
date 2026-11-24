@@ -4345,6 +4345,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         Some((record, cached.is_some())),
         || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv),
     );
+    let mut refusal_elapsed = in_driver;
     if hr < 0 && cached.is_some() {
         // a blob the driver does not take (another root signature at the same address…): compiled
         forget_compute_blob(key);
@@ -4361,6 +4362,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         );
         hr = retried;
         in_driver += took;
+        refusal_elapsed = took;
     }
     let mut reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
     if hr >= 0 && !reused {
@@ -4384,6 +4386,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         let mut retry_attempted = false;
         let (retry_hr, retried) = retry_compute_pso_without_gvn(
             first_hr,
+            refusal_elapsed,
             &dxil,
             || {
                 let without = console_to_dxil_without_gvn(cs, Stage::Compute, 0, wave32_only(this))?;
@@ -4517,15 +4520,20 @@ fn format_driver_rejection(hr: HRESULT, retained_message: Option<&str>) -> Strin
     first_error_line(&msg).map(str::to_string).unwrap_or_else(|| format!("{hr:#x}"))
 }
 
-/// Retry a driver-rejected compute PSO once using DXIL recompiled without DXC's GVN pass
+/// Upper bound on how long an initial driver refusal may take to qualify for a `-opt-disable gvn`
+/// retry: fast handle-phi refusals can benefit, while multi-minute OOMs should not pay for another compile.
+pub(crate) const NO_GVN_RETRY_MAX_REFUSAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Retry a fast driver-rejected compute PSO once using DXIL recompiled without DXC's GVN pass
 /// (avoiding handle phis that some drivers refuse with `E_OUTOFMEMORY`, #756).
 fn retry_compute_pso_without_gvn(
     first_hr: HRESULT,
+    first_elapsed: std::time::Duration,
     orig_dxil: &[u8],
     recompile: impl FnOnce() -> Result<Vec<u8>, String>,
     mut create: impl FnMut(&[u8]) -> HRESULT,
 ) -> (HRESULT, bool) {
-    if first_hr >= 0 {
+    if first_hr >= 0 || first_elapsed > NO_GVN_RETRY_MAX_REFUSAL {
         return (first_hr, false);
     }
     let Ok(retry_dxil) = recompile() else {
@@ -4536,6 +4544,118 @@ fn retry_compute_pso_without_gvn(
     }
     let hr2 = create(&retry_dxil);
     (hr2, hr2 >= 0)
+}
+
+#[cfg(test)]
+mod compute_pso_retry_tests {
+    use super::*;
+
+    const REFUSED_OOM: HRESULT = 0x8007_000Eu32 as i32;
+    const REFUSED_ARG: HRESULT = 0x8007_0057u32 as i32;
+
+    #[test]
+    fn compute_pso_success_skips_no_gvn_retry() {
+        let mut calls = 0;
+        let (hr, retried) = retry_compute_pso_without_gvn(0, std::time::Duration::ZERO, b"orig", || panic!("successful PSO must not recompile"), |_| {
+            calls += 1;
+            0
+        });
+        assert_eq!((hr, retried, calls), (0, false, 0));
+    }
+
+    #[test]
+    fn compute_pso_refusal_retries_without_gvn() {
+        let mut seen = Vec::new();
+        let (hr, retried) = retry_compute_pso_without_gvn(
+            REFUSED_OOM,
+            std::time::Duration::from_millis(100),
+            b"orig-dxil",
+            || Ok(b"no-gvn-dxil".to_vec()),
+            |dxil| {
+                seen.push(dxil.to_vec());
+                0
+            },
+        );
+        assert_eq!((hr, retried), (0, true));
+        assert_eq!(seen, vec![b"no-gvn-dxil".to_vec()]);
+    }
+
+    #[test]
+    fn compute_pso_refusal_skips_unchanged_dxil() {
+        let mut calls = 0;
+        let (hr, retried) = retry_compute_pso_without_gvn(
+            REFUSED_OOM,
+            std::time::Duration::from_millis(100),
+            b"same-dxil",
+            || Ok(b"same-dxil".to_vec()),
+            |_| {
+                calls += 1;
+                0
+            },
+        );
+        assert_eq!((hr, retried, calls), (REFUSED_OOM, false, 0));
+    }
+
+    #[test]
+    fn compute_pso_refusal_propagates_retry_failure() {
+        let (hr1, retried1) = retry_compute_pso_without_gvn(
+            REFUSED_OOM,
+            std::time::Duration::from_millis(100),
+            b"orig-dxil",
+            || Err("already -O0".into()),
+            |_| 0,
+        );
+        assert_eq!((hr1, retried1), (REFUSED_OOM, false));
+        let (hr2, retried2) = retry_compute_pso_without_gvn(
+            REFUSED_OOM,
+            std::time::Duration::from_millis(100),
+            b"orig-dxil",
+            || Ok(b"no-gvn-dxil".to_vec()),
+            |_| REFUSED_ARG,
+        );
+        assert_eq!((hr2, retried2), (REFUSED_ARG, false));
+    }
+
+    #[test]
+    fn compute_pso_slow_refusal_skips_no_gvn_retry() {
+        let mut calls = 0;
+        let (hr, retried) = retry_compute_pso_without_gvn(
+            REFUSED_OOM,
+            std::time::Duration::from_secs(6),
+            b"orig-dxil",
+            || panic!("slow refusal must not trigger another compile"),
+            |_| {
+                calls += 1;
+                0
+            },
+        );
+        assert_eq!((hr, retried, calls), (REFUSED_OOM, false, 0));
+        let (hr_edge, retried_edge) = retry_compute_pso_without_gvn(
+            REFUSED_OOM,
+            NO_GVN_RETRY_MAX_REFUSAL,
+            b"orig-dxil",
+            || Ok(b"no-gvn-dxil".to_vec()),
+            |_| 0,
+        );
+        assert_eq!((hr_edge, retried_edge), (0, true));
+    }
+
+    #[test]
+    fn first_error_line_picks_first_nonempty_trimmed_line() {
+        assert_eq!(first_error_line("\n  \n  useful detail \r\nsecond line\n"), Some("useful detail"));
+        assert_eq!(first_error_line("  \r\n\t "), None);
+    }
+
+    #[test]
+    fn format_driver_rejection_uses_debug_message_or_hresult() {
+        assert_eq!(
+            format_driver_rejection(REFUSED_OOM, Some("\n D3D12 ERROR: rejected phi handle \nsecond line")),
+            "0x8007000e: D3D12 ERROR: rejected phi handle"
+        );
+        let fallback = format_driver_rejection(REFUSED_OOM, None);
+        assert!(!fallback.is_empty() && !fallback.contains('\n'));
+        assert!(fallback.to_ascii_lowercase().contains("8007000e"));
+    }
 }
 
 /// The blobs of `COMPUTE_BLOBS`, kept on disk between runs.
