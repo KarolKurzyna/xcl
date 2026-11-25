@@ -2064,7 +2064,7 @@ mod shader_cache_tests {
             Ok(compiled(77))
         })
         .unwrap();
-        assert_eq!(rebuilt.dxil[0], 77);
+        assert_eq!(rebuilt.dxil[67], 77);
         assert!(!translated::fail_file(&dir, ident, blob_refused, Stage::Compute, 0, 4, false).is_file());
 
         let still_cached = translated::cached_in_with_negative(&dir, ident, cap_v1, true, blob_other, Stage::Compute, 0, 4, false, || {
